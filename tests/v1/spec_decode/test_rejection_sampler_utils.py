@@ -280,3 +280,184 @@ def test_synthetic_rejection_sample(
             f"Step {i}: observed rate {observed_rate:.4f} deviates from "
             f"expected rate {expected_rate:.4f} by more than {deviation_tol}."
         )
+
+
+def test_placeholder_draft_token_rejected():
+    """A placeholder draft id (-1) must be rejected without reading the logit
+    tensors out of bounds, for any sampling method.
+    """
+    torch.manual_seed(0)
+    device = "cuda"
+    num_trials = 64
+    K = 1
+    temperature = 0.6
+
+    target_logits_1d = torch.randn(VOCAB_SIZE, device=device) / temperature
+    draft_logits_1d = torch.randn(VOCAB_SIZE, device=device) / temperature
+
+    inputs = _build_rejection_sample_inputs(
+        target_logits_1d,
+        draft_logits_1d,
+        K,
+        temperature=temperature,
+        num_trials=num_trials,
+    )
+    inputs["draft_sampled"].view(num_trials, K + 1)[:, 1:] = -1
+
+    sampled, num_sampled = rejection_sample(**inputs, num_speculative_steps=K)
+
+    assert torch.equal(num_sampled, torch.ones_like(num_sampled))
+    recovered = sampled[:, 0]
+    assert (recovered >= 0).all() and (recovered < VOCAB_SIZE).all()
+
+
+@pytest.mark.parametrize(
+    "num_speculative_steps,temperature",
+    [
+        (1, 0.6),
+        (3, 0.6),
+        (1, 1.0),
+        (3, 1.0),
+        (5, 1.0),
+    ],
+)
+@pytest.mark.parametrize("has_draft_logits", [True, False])
+def test_block_verification_rejection_sample(
+    num_speculative_steps: int, temperature: float, has_draft_logits: bool
+):
+    """
+    Verify that block verification (Sun et al.) preserves the target
+    distribution at every accepted position, for both the full draft-logits
+    case and the one-hot (no draft logits) case. Block verification changes
+    *which* prefix is accepted, but the marginal of every output position must
+    still match the target distribution p(x).
+    """
+
+    torch.manual_seed(42)
+    device = "cuda"
+    num_trials = 10 * VOCAB_SIZE
+
+    target_logits_1d = torch.randn(VOCAB_SIZE, device=device, dtype=torch.float32)
+    draft_logits_1d = torch.randn(VOCAB_SIZE, device=device, dtype=torch.float32)
+
+    if temperature > 0:
+        target_logits_1d /= temperature
+        draft_logits_1d /= temperature
+
+    inputs = _build_rejection_sample_inputs(
+        target_logits_1d,
+        draft_logits_1d,
+        num_speculative_steps,
+        temperature=temperature,
+        num_trials=num_trials,
+    )
+    if not has_draft_logits:
+        inputs["draft_logits"] = None
+
+    sampled, num_sampled = rejection_sample(
+        **inputs,
+        num_speculative_steps=num_speculative_steps,
+        use_block_verification=True,
+    )
+
+    target_probs = torch.softmax(target_logits_1d, dim=0)
+    for pos in range(num_speculative_steps + 1):
+        accepted_mask = num_sampled >= pos + 1
+        _assert_distribution_match(
+            sampled[accepted_mask, pos], target_probs, device, label=f"position {pos}"
+        )
+
+
+@pytest.mark.parametrize("num_speculative_steps", [3, 5])
+def test_block_verification_accepts_at_least_as_many(num_speculative_steps: int):
+    """
+    Block verification is designed to accept at least as long a prefix as
+    token verification in expectation. Verify the mean accepted length is no
+    worse than the standard method on the same inputs.
+    """
+
+    torch.manual_seed(0)
+    device = "cuda"
+    num_trials = 20 * VOCAB_SIZE
+    temperature = 1.0
+
+    target_logits_1d = torch.randn(VOCAB_SIZE, device=device, dtype=torch.float32)
+    # A draft close to the target gives block verification room to recover
+    # prefixes that token verification would have truncated.
+    draft_logits_1d = target_logits_1d + 0.5 * torch.randn(
+        VOCAB_SIZE, device=device, dtype=torch.float32
+    )
+
+    inputs = _build_rejection_sample_inputs(
+        target_logits_1d,
+        draft_logits_1d,
+        num_speculative_steps,
+        temperature=temperature,
+        num_trials=num_trials,
+    )
+
+    _, num_sampled_standard = rejection_sample(
+        **inputs, num_speculative_steps=num_speculative_steps
+    )
+    _, num_sampled_block = rejection_sample(
+        **inputs,
+        num_speculative_steps=num_speculative_steps,
+        use_block_verification=True,
+    )
+
+    mean_standard = (num_sampled_standard - 1).float().mean().item()
+    mean_block = (num_sampled_block - 1).float().mean().item()
+    # Allow a small slack for sampling noise.
+    assert mean_block >= mean_standard - 1e-2, (
+        f"Block verification mean accepted length {mean_block:.4f} is worse "
+        f"than standard {mean_standard:.4f}."
+    )
+
+
+@pytest.mark.parametrize("temperature", [0.0, 0.6])
+def test_padded_draft_prefix_accepted(temperature: float):
+    """Padded speculation: real draft tokens up to a per-request valid length,
+    -1 pads after. Acceptance must stop at the first pad (recovery token
+    resampled there), and real prefix tokens must still be accepted normally.
+    """
+    torch.manual_seed(0)
+    device = "cuda"
+    K = 4
+    num_trials = 256
+
+    target_logits_1d = torch.randn(VOCAB_SIZE, device=device)
+    if temperature > 0:
+        target_logits_1d = target_logits_1d / temperature
+    # Draft == target so every real (non-pad) draft position is accepted:
+    # greedy accepts on argmax match; stochastic accepts since p(x) == q(x).
+    draft_logits_1d = target_logits_1d.clone()
+
+    inputs = _build_rejection_sample_inputs(
+        target_logits_1d,
+        draft_logits_1d,
+        K,
+        temperature=temperature,
+        num_trials=num_trials,
+    )
+    draft_sampled_2d = inputs["draft_sampled"].view(num_trials, K + 1)
+    if temperature == 0:
+        # Make the real drafts the target argmax so greedy accepts them.
+        draft_sampled_2d[:, 1:] = target_logits_1d.argmax()
+    # Request r keeps valid_len[r] real drafts, the rest are pads.
+    valid_len = torch.arange(num_trials, dtype=torch.int64, device=device) % (K + 1)
+    local_draft_pos = torch.arange(1, K + 1, device=device).unsqueeze(0)
+    draft_sampled_2d[:, 1:] = torch.where(
+        local_draft_pos <= valid_len.unsqueeze(1), draft_sampled_2d[:, 1:], -1
+    )
+
+    sampled, num_sampled = rejection_sample(**inputs, num_speculative_steps=K)
+
+    # Exactly the real prefix + one recovery/bonus token is sampled.
+    assert torch.equal(num_sampled.long(), valid_len + 1), (
+        f"num_sampled={num_sampled.tolist()[:12]} valid_len={valid_len.tolist()[:12]}"
+    )
+    # All sampled tokens are valid vocab ids (recovery token never reads pads).
+    for r in range(0, num_trials, 17):
+        n = int(num_sampled[r])
+        toks = sampled[r, :n]
+        assert (toks >= 0).all() and (toks < VOCAB_SIZE).all()
