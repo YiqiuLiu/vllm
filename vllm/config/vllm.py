@@ -794,6 +794,14 @@ class VllmConfig:
             or self.use_v2_model_runner
         ):
             return
+        if (
+            speculative_config.method == "dspark"
+            and speculative_config.dspark_scheduler
+        ):
+            # DSpark's scheduler captures FULL decode graphs at every width
+            # dynamic SD can schedule, so no downgrade is needed; without it
+            # the extra graphs are not captured and the downgrade applies.
+            return
 
         logger.warning_once(
             "Dynamic speculative decoding changes the target verification "
@@ -2114,6 +2122,15 @@ class VllmConfig:
                 "dspark",
             ):
                 unsupported.append(f"speculative method '{speculative_config.method}'")
+
+            # Dynamic SD on the V2 runner: the engine-side width control
+            # flows through the existing variable cu_num_logits plumbing;
+            # DSpark additionally keeps the trimmed verify graph-native.
+            if speculative_config.uses_dynamic_speculative_decoding() and not (
+                speculative_config.method == "dspark"
+                and speculative_config.dspark_scheduler
+            ):
+                unsupported.append("dynamic speculative decoding")
 
             # V2 EagleSpeculator does not support parallel_drafting (for P-Eagle).
             # DFlash and DSpark use parallel drafting natively in V2 via their
