@@ -47,6 +47,77 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+def _resolve_layer_attention(
+    config: Qwen3Config, layer_idx: int
+) -> tuple[int | None, bool]:
+    """Resolve ``(sliding_window, causal)`` for one DFlash draft layer.
+
+    +----------------------+-------------------------+--------------------------------+
+    | Config               | ``layer_type``          | *``causal``                    |
+    +======================+=========================+================================+
+    | ``layer_types``      | SWA if ``use_swa``      | True if ``layer_types[i]=SWA`` |
+    |                      | else ``layer_types[i]`` | else False                     |
+    +----------------------+-------------------------+--------------------------------+
+    | ``layer_types=None`` | SWA                     | False                          |
+    | + ``use_swa=True``   |                         |                                |
+    +----------------------+-------------------------+--------------------------------+
+    | ``layer_types=None`` | Full                    | False                          |
+    | + ``use_swa=False``  |                         |                                |
+    +----------------------+-------------------------+--------------------------------+
+    * If ``dflash_config.causal`` is set, its value overrides ``causal`` for all layers.
+
+    This is to support a varied ecosystem of checkpoints, including:
+    - XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash (sets "use_swa", assumes non-causal)
+    - z-lab/gemma-4-31B-it-DFlash (has mixed layer types, assumes causal only for SWA)
+    - z-lab/Qwen3.5-9B-DFlash ("standard" DFlash, all full attn, assumes non-causal)
+    """
+    dflash_config = getattr(config, "dflash_config", None) or {}
+    layer_types = getattr(config, "layer_types", None)
+    use_swa = dflash_config.get("use_swa", False)
+    config_causal = dflash_config.get("causal", None)
+
+    SLIDING_ATTENTION = "sliding_attention"
+    any_sliding = False
+    if layer_types is not None:
+        num_sliding = sum(lt == SLIDING_ATTENTION for lt in layer_types)
+        any_sliding = num_sliding > 0
+        # Mixed sliding/full attention needs multiple KV groups (V2 runner only).
+        if (
+            0 < num_sliding < len(layer_types)
+            and not get_current_vllm_config().use_v2_model_runner
+        ):
+            raise NotImplementedError(
+                "DFlash drafters with mixed sliding/full attention require "
+                "the V2 model runner; relaunch with "
+                "VLLM_USE_V2_MODEL_RUNNER=1."
+            )
+
+    default_causal = False
+    if layer_types is None or (use_swa and not any_sliding):
+        # An absent ``layer_types`` (or the all-"full_attention" one that may
+        # be synthesized when the checkpoint omits it) must not override
+        # ``dflash_config.use_swa``, which forces SWA on every layer.
+        is_sliding = use_swa
+    else:
+        is_sliding = layer_types[layer_idx] == SLIDING_ATTENTION
+        # Full-attention layers default non-causal; SWA layers default causal.
+        default_causal = is_sliding
+
+    sliding_window = None
+    if is_sliding:
+        sliding_window = dflash_config.get(
+            "swa_window_size", getattr(config, "sliding_window", None)
+        )
+        if sliding_window is None:
+            raise ValueError(
+                "DFlash sliding attention requires a window size configured in "
+                "dflash_config.swa_window_size or the top-level sliding_window."
+            )
+
+    causal = config_causal if config_causal is not None else default_causal
+    return sliding_window, causal
+
+
 class DFlashQwen3Attention(nn.Module):
     """Attention for DFlash speculative decoding.
 
@@ -119,6 +190,7 @@ class DFlashQwen3Attention(nn.Module):
             prefix=f"{prefix}.attn",
             attn_type=attn_type,
         )
+        self.causal = causal
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
@@ -543,6 +615,14 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.model(input_ids, positions, inputs_embeds)
+
+    def get_draft_kv_cache_layer_names(self) -> list[str]:
+        return [layer.self_attn.attn.layer_name for layer in self.model.layers]
+
+    def get_draft_attn_causal(self) -> list[bool]:
+        """Per-layer attention causality, aligned with
+        get_draft_kv_cache_layer_names."""
+        return [layer.self_attn.causal for layer in self.model.layers]
 
     def compute_logits(
         self,
