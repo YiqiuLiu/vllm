@@ -468,7 +468,6 @@ def build_attn_metadata(
     positions: torch.Tensor | None = None,
     model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     for_cudagraph_capture: bool = False,
-    causal: bool = True,
     causal: bool | Mapping[int, bool] = True,
     rswa_prefix_lens: torch.Tensor | None = None,
 ) -> dict[str, Any]:
